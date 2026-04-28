@@ -13,8 +13,8 @@ use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput,
-    VK_CONTROL, VK_SHIFT,
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_CONTROL, VK_SHIFT,
+    VK_V,
 };
 
 fn main() {
@@ -28,6 +28,9 @@ fn main() {
     let hotkey_id = hotkey.id();
     hotkey_manager.register(hotkey).expect("register hotkey");
     let mut enabled = true;
+    let mut registered = true;
+    let mut last_path: Option<String> = None;
+    let mut reregister_at: Option<Instant> = None;
 
     let menu = Menu::new();
     let toggle_item = CheckMenuItem::new("Enabled (Ctrl+Shift+V)", true, true, None);
@@ -60,11 +63,24 @@ fn main() {
     event_loop.run(move |_event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + poll_interval);
 
+        if let Some(deadline) = reregister_at {
+            if Instant::now() >= deadline {
+                if enabled && !registered {
+                    let _ = hotkey_manager.register(hotkey);
+                    registered = true;
+                }
+                reregister_at = None;
+            }
+        }
+
         while let Ok(e) = hotkey_rx.try_recv() {
             if e.id == hotkey_id && e.state == HotKeyState::Pressed && enabled {
-                if let Err(err) = handle_hotkey(&temp_dir) {
+                let _ = hotkey_manager.unregister(hotkey);
+                registered = false;
+                if let Err(err) = handle_hotkey(&temp_dir, &mut last_path) {
                     eprintln!("hotkey error: {err}");
                 }
+                reregister_at = Some(Instant::now() + Duration::from_millis(300));
             }
         }
 
@@ -74,8 +90,12 @@ fn main() {
                 if now_checked && !enabled {
                     let _ = hotkey_manager.register(hotkey);
                     enabled = true;
+                    registered = true;
                 } else if !now_checked && enabled {
-                    let _ = hotkey_manager.unregister(hotkey);
+                    if registered {
+                        let _ = hotkey_manager.unregister(hotkey);
+                        registered = false;
+                    }
                     enabled = false;
                 }
             } else if e.id == open_folder_id {
@@ -93,21 +113,37 @@ fn main() {
     });
 }
 
-fn handle_hotkey(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let path = save_clipboard_image(dir)?;
-    let wsl = windows_to_wsl(&path);
+fn handle_hotkey(
+    dir: &Path,
+    last_path: &mut Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut clip = arboard::Clipboard::new()?;
 
-    std::thread::sleep(Duration::from_millis(40));
-    unsafe { type_text(&wsl) };
+    let wsl = match clip.get_image() {
+        Ok(img) => {
+            let path = save_image(dir, img)?;
+            let wsl = windows_to_wsl(&path);
+            *last_path = Some(wsl.clone());
+            wsl
+        }
+        Err(_) => match last_path {
+            Some(p) => p.clone(),
+            None => return Err("no image on clipboard and no cached path yet".into()),
+        },
+    };
+
+    clip.set_text(&wsl)?;
+    drop(clip);
+
+    std::thread::sleep(Duration::from_millis(60));
+    unsafe { send_paste() };
     Ok(())
 }
 
-fn save_clipboard_image(dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let mut clip = arboard::Clipboard::new()?;
-    let img = clip
-        .get_image()
-        .map_err(|e| format!("no image on clipboard: {e}"))?;
-
+fn save_image(
+    dir: &Path,
+    img: arboard::ImageData,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let bytes = img.bytes.into_owned();
     let hash_hex = blake3::hash(&bytes).to_hex();
     let short = &hash_hex.as_str()[..16];
@@ -149,25 +185,24 @@ fn windows_to_wsl(path: &Path) -> String {
     s.replace('\\', "/")
 }
 
-unsafe fn type_text(text: &str) {
-    let releases = [
+unsafe fn send_paste() {
+    // Force a clean Ctrl+Shift+V (Linux/WSL terminal paste). The hotkey has been
+    // unregistered for this brief window, so the injection won't re-fire it.
+    let inputs = [
+        key(VK_CONTROL, KEYEVENTF_KEYUP),
+        key(VK_SHIFT, KEYEVENTF_KEYUP),
+        key(VK_CONTROL, 0),
+        key(VK_SHIFT, 0),
+        key(VK_V, 0),
+        key(VK_V, KEYEVENTF_KEYUP),
         key(VK_SHIFT, KEYEVENTF_KEYUP),
         key(VK_CONTROL, KEYEVENTF_KEYUP),
     ];
     SendInput(
-        releases.len() as u32,
-        releases.as_ptr(),
+        inputs.len() as u32,
+        inputs.as_ptr(),
         std::mem::size_of::<INPUT>() as i32,
     );
-
-    for unit in text.encode_utf16() {
-        let inputs = [unicode_key(unit, 0), unicode_key(unit, KEYEVENTF_KEYUP)];
-        SendInput(
-            inputs.len() as u32,
-            inputs.as_ptr(),
-            std::mem::size_of::<INPUT>() as i32,
-        );
-    }
 }
 
 fn key(vk: u16, flags: u32) -> INPUT {
@@ -178,21 +213,6 @@ fn key(vk: u16, flags: u32) -> INPUT {
                 wVk: vk,
                 wScan: 0,
                 dwFlags: flags,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    }
-}
-
-fn unicode_key(unit: u16, flags: u32) -> INPUT {
-    INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: 0,
-                wScan: unit,
-                dwFlags: KEYEVENTF_UNICODE | flags,
                 time: 0,
                 dwExtraInfo: 0,
             },
