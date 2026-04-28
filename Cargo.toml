@@ -1,0 +1,21 @@
+[package]
+name = "claude-image-fixer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arboard = "3.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+blake3 = "1.5"
+tao = "0.30"
+tray-icon = "0.19"
+global-hotkey = "0.6"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
